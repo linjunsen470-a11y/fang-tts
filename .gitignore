@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+.pip-tmp/
+__pycache__/
+*.py[cod]
+*.mp3
+*.wav
+*.opus
+*.pcm
+output/
+.idea/
+.vscode/

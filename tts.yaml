@@ -1,0 +1,30 @@
+# Fish Audio API Playground example voice (女大学生)
+model: s2.1-pro-free
+reference_id: "5c353fdb312f4888836a9a5680099ef0"
+
+# Emotion markers such as [excited] and [laughing] are passed through as text.
+text: >-
+  [excited] Hello! Welcome to Fish Audio. [laughing] This is my first
+  AI-generated voice.
+
+output: output/welcome.mp3
+
+# TTSConfig fields supported by the Fish Audio Python SDK.
+tts:
+  format: mp3
+  sample_rate: null
+  mp3_bitrate: 128
+  opus_bitrate: 32
+  normalize: true
+  chunk_length: 200
+  latency: balanced
+  prosody:
+    speed: 1.0
+    volume: 0.0
+  top_p: 0.7
+  temperature: 0.7
+  max_new_tokens: 1024
+  repetition_penalty: 1.2
+  min_chunk_length: 50
+  condition_on_previous_chunks: true
+  early_stop_threshold: 1.0
