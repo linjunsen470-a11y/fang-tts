@@ -1,117 +1,107 @@
-"""Generate Fish Audio speech from a YAML configuration file."""
-
+"""Single whole-script Fish TTS. Running synthesis is the user's confirmation."""
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
-import sys
+import tempfile
 from pathlib import Path
-from typing import Any
 
-import yaml
-from fishaudio import FishAudio
-from fishaudio.types import Prosody, TTSConfig
+import httpx
 
-from config import ROOT, load_api_key
+from breaths import apply_breaths
+from config import DEFAULT_MODEL, DEFAULT_TTS, ROOT, VOICE_REFERENCE_ID, load_api_key, read_tts_text, read_yaml
+from fish_api import request_payload, synthesize as fish_synthesize
+from media_utils import audio_duration, binary, publish
 
-LOGGER = logging.getLogger("fish-tts")
-CONFIG_FIELDS = set(TTSConfig.model_fields) - {"reference_id", "references", "prosody"}
+LOG = logging.getLogger("fish-tts")
 
 
-def read_config(path: Path) -> tuple[dict[str, Any], Path]:
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ValueError(f"cannot read YAML file {path}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise ValueError(f"invalid YAML in {path}: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError("YAML root must be a mapping")
-
-    for field in ("model", "reference_id", "text", "output"):
-        if not isinstance(data.get(field), str) or not data[field].strip():
-            raise ValueError(f"'{field}' must be a non-empty string")
-
+def validate_config(data: dict, path: Path) -> tuple[Path, dict, str, bool]:
+    unknown = set(data) - {"model", "reference_id", "text", "text_file", "output", "tts"}
+    if unknown:
+        raise ValueError(f"未知配置字段：{', '.join(sorted(map(str, unknown)))}；仅支持整段 TTS YAML。")
+    if not isinstance(data.get("output"), str) or not data["output"].strip():
+        raise ValueError("output 必须是非空文本。")
+    text, text_path = read_tts_text(data, path)
+    if data.get("model", DEFAULT_MODEL) != DEFAULT_MODEL:
+        raise ValueError("模型固定为 s2.1-pro-free；音色可通过 reference_id 调整。")
+    reference_id = data.get("reference_id", VOICE_REFERENCE_ID)
     options = data.get("tts", {})
     if not isinstance(options, dict):
-        raise ValueError("'tts' must be a YAML mapping")
-    unknown = set(options) - CONFIG_FIELDS - {"prosody"}
-    if unknown:
-        raise ValueError(f"unknown 'tts' option(s): {', '.join(sorted(unknown))}")
+        raise ValueError("tts 必须是键值映射。")
+    merged = copy.deepcopy(DEFAULT_TTS)
+    merged.update(options)
+    if isinstance(options.get("prosody"), dict):
+        merged["prosody"] = {**DEFAULT_TTS["prosody"], **options["prosody"]}
+    breaths = merged.pop("breaths", False)
+    if breaths is not True and breaths is not False:
+        raise ValueError("tts.breaths 只能是 true 或 false。")
+    request_payload(text, reference_id, merged)
+    output = Path(data["output"])
+    if not output.is_absolute():
+        output = path.resolve().parent / output
+    if output.suffix.lower() != f".{merged['format']}":
+        raise ValueError("output 扩展名必须与 tts.format 一致。")
+    for source in (path, text_path):
+        if source is not None and (
+            output.resolve() == source.resolve()
+            or (output.exists() and source.exists() and output.samefile(source))
+        ):
+            raise ValueError("output 不能指向 YAML 或台词源文件，--overwrite 也不允许覆盖源文件。")
+    return output, merged, text, breaths
 
-    prosody = options.get("prosody", {})
-    if not isinstance(prosody, dict):
-        raise ValueError("'tts.prosody' must be a YAML mapping")
-    unknown_prosody = set(prosody) - set(Prosody.model_fields)
-    if unknown_prosody:
-        raise ValueError(
-            f"unknown 'tts.prosody' option(s): {', '.join(sorted(unknown_prosody))}"
-        )
 
-    output_path = Path(data["output"])
-    if not output_path.is_absolute():
-        output_path = path.resolve().parent / output_path
-    return data, output_path
-
-
-def synthesize(config_path: Path) -> Path:
-    data, output_path = read_config(config_path)
+def single_tts(path: Path, check: bool = False, overwrite: bool = False) -> None:
+    data = read_yaml(path)
+    output, options, text, breaths = validate_config(data, path)
+    reference_id = data.get("reference_id", VOICE_REFERENCE_ID)
+    if check:
+        LOG.info("校验通过（未联网、未读取密钥）：%s → %s；音色 %s", path, output, reference_id)
+        if output.exists():
+            LOG.info("输出已存在；实际合成需更改文件名或显式使用 --overwrite。")
+        return
+    if output.exists() and not overwrite:
+        raise ValueError(f"输出已存在：{output}；请换文件名，或使用 --overwrite。")
+    if options["format"] != "pcm":
+        binary("ffprobe")
     api_key = load_api_key()
-
-    options = dict(data.get("tts", {}))
-    prosody = options.pop("prosody", {})
-    tts_config = TTSConfig(
-        reference_id=data["reference_id"].strip(),
-        prosody=Prosody(**prosody),
-        **options,
-    )
-
-    LOGGER.info("model: %s", data["model"])
-    LOGGER.info("reference_id: %s", data["reference_id"].strip())
-    LOGGER.info("text: %s", data["text"])
-    LOGGER.info("output: %s", output_path)
-    LOGGER.info("requesting Fish Audio TTS...")
-
-    client = FishAudio(api_key=api_key)
+    LOG.info("开始整段配音，model=%s，reference_id=%s", DEFAULT_MODEL, reference_id)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp = None
     try:
-        audio = client.tts.convert(
-            text=data["text"],
-            model=data["model"].strip(),
-            config=tts_config,
-        )
+        with tempfile.NamedTemporaryFile(prefix=".tts-", suffix=output.suffix, dir=output.parent, delete=False) as handle:
+            temp = Path(handle.name)
+            handle.write(fish_synthesize(text, api_key, DEFAULT_MODEL, reference_id, options))
+        if breaths:
+            inserted, skipped = apply_breaths(temp, text, options.get("mp3_bitrate"))
+            LOG.info("整段一次合成，句末气口 %d 处，跳过 %d 处。", inserted, skipped)
+        duration = audio_duration(temp, options["format"], options.get("sample_rate"))
+        size = temp.stat().st_size
+        publish(temp, output, overwrite)
+        LOG.info("完成：%s；%d 字节；实际时长 %.2f 秒。", output, size, duration)
     finally:
-        client.close()
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(audio)
-    LOGGER.info("done: %s (%s bytes)", output_path, len(audio))
-    return output_path
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Fish Audio TTS (YAML driven)")
-    parser.add_argument(
-        "config",
-        nargs="?",
-        type=Path,
-        default=ROOT / "tts.yaml",
-        help="configuration YAML (default: tts.yaml)",
-    )
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-    )
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Fish Audio 整段配音；主动运行即确认台词已审核")
+    parser.add_argument("config", nargs="?", type=Path, default=ROOT / "tts.yaml")
+    parser.add_argument("--check", action="store_true", help="只做离线校验，不读取密钥或调用 API")
+    parser.add_argument("--overwrite", action="store_true", help="允许成功合成后替换已有音频")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
-        synthesize(args.config)
-    except Exception as exc:
-        LOGGER.error("TTS failed: %s", exc)
-        return 1
-    return 0
+        single_tts(args.config, args.check, args.overwrite)
+        return 0
+    except httpx.HTTPStatusError as exc:
+        LOG.error("Fish API 请求失败（HTTP %s）。请检查账户、权限或稍后重试。", exc.response.status_code)
+    except httpx.RequestError:
+        LOG.error("Fish API 网络连接失败或超时；未自动重试，请检查后手动重试。")
+    except (OSError, ValueError, RuntimeError) as exc:
+        LOG.error("失败：%s", exc)
+    return 1
 
 
 if __name__ == "__main__":

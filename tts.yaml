@@ -1,30 +1,21 @@
-# Fish Audio API Playground example voice (女大学生)
+# 审核台词后主动运行 synthesize.bat，即确认生成整段配音。
+# 修改台词请编辑 tts.txt（UTF-8）；text_file 和 output 的相对路径以本 YAML 所在文件夹为基准。
 model: s2.1-pro-free
+# 默认音色；可替换为你选择的 Fish Audio 音色 ID。
 reference_id: "5c353fdb312f4888836a9a5680099ef0"
-
-# Emotion markers such as [excited] and [laughing] are passed through as text.
-text: >-
-  [excited] Hello! Welcome to Fish Audio. [laughing] This is my first
-  AI-generated voice.
-
-output: output/welcome.mp3
-
-# TTSConfig fields supported by the Fish Audio Python SDK.
+text_file: tts.txt
+# 句末气口收到约 0.50 秒。此前各版 mp3 都保留。
+output: output/narration-v9.mp3
 tts:
+  breaths: true
   format: mp3
-  sample_rate: null
   mp3_bitrate: 128
-  opus_bitrate: 32
   normalize: true
-  chunk_length: 200
-  latency: balanced
+  chunk_length: 300
+  latency: normal
   prosody:
-    speed: 1.0
+    speed: 1.1
     volume: 0.0
-  top_p: 0.7
+    normalize_loudness: false
   temperature: 0.7
-  max_new_tokens: 1024
-  repetition_penalty: 1.2
-  min_chunk_length: 50
-  condition_on_previous_chunks: true
-  early_stop_threshold: 1.0
+  top_p: 0.7
